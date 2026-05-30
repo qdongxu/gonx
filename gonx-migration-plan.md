@@ -133,7 +133,7 @@ src/
 | **ngx_http_write_filter_module** | **Migrate** | 输出缓冲写入 |
 | **ngx_http_range_header_filter_module** | **Migrate** | Range 响应头处理 |
 | **ngx_http_v2_filter_module** | **Migrate** | HTTP/2 响应帧 |
-| **ngx_http_v3_filter_module** | **Defer** | HTTP/3 响应帧 |
+| **ngx_http_v3_filter_module** | **Skip** | HTTP/3 响应帧 — 已确认不纳入路线图 |
 | **ngx_http_status_module** | **Skip** | 已废弃（`--without-http_upstream_sticky` 废弃时关联） |
 
 ### 3.3 Stream (L4) 模块分类
@@ -160,7 +160,7 @@ src/
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| **全部 Mail 模块** | **Skip** | IMAP/POP3/SMTP 代理是小众需求，且 Go 生态有更好专用方案（如 Haraka, Stalwart） |
+| **全部 Mail 模块** | **Skip** | IMAP/POP3/SMTP 代理 — 已确认现阶段直接 Skip，Go 生态有更好专用方案（如 Haraka, Stalwart） |
 
 ### 3.5 核心/事件模块分类
 
@@ -187,12 +187,12 @@ src/
 
 | 类别 | 模块数量 | Migrate | Defer | Skip |
 |------|---------|---------|-------|------|
-| HTTP 核心 + Filter | 47 | 32 | 10 | 5 |
+| HTTP 核心 + Filter | 47 | 32 | 9 | 6 |
 | HTTP 处理器 + Upstream | 30 | 20 | 7 | 3 |
 | Stream | 20 | 14 | 2 | 4 |
 | Mail | 12 | 0 | 0 | 12 |
 | 核心/事件 | 15 | 2 | 0 | 13 |
-| **总计** | **124** | **68 (55%)** | **19 (15%)** | **37 (30%)** |
+| **总计** | **124** | **68 (55%)** | **18 (15%)** | **38 (31%)** |
 
 ---
 
@@ -200,7 +200,7 @@ src/
 
 ### 4.1 网络模型选型
 
-**方案 A: 标准库 `net/http` + `net`（推荐作为基线）**
+**方案 A: 标准库 `net/http` + `net`（推荐作为基线，已确认）**
 
 ```go
 // 基线实现：利用 Go 原生网络栈
@@ -213,11 +213,11 @@ server := &http.Server{
 }
 ```
 
-- **优点**: 稳定、生态丰富、HTTP/2 内置、TLS 内置、跨平台
+- **优点**: 稳定、生态丰富、HTTP/2 内置、TLS 内置、跨平台、无已知安全漏洞
 - **缺点**: 每个连接一个 goroutine（内存 ~2-4KB/conn），C10M 场景有瓶颈
-- **适用**: 80% 的场景，开发速度优先
+- **适用**: 80% 的场景，开发速度优先，符合 gonx 第一优先级
 
-**方案 B: `cloudwego/netpoll`（性能优先场景）**
+**方案 B: `cloudwego/netpoll`（性能优先场景，需明确优势证明）**
 
 ```go
 // 零拷贝 + 事件驱动 + goroutine 池
@@ -228,20 +228,18 @@ eventLoop, _ := netpoll.NewEventLoop(handler)
 eventLoop.Serve(listener)
 ```
 
-- **优点**: 字节跳动生产验证，减少 goroutine 数量，零拷贝读写，适合 RPC/高并发
-- **缺点**: 不支持 Windows，API 不兼容 `net/http`，学习曲线
-- **适用**: 需要极致性能、非 Windows 部署
+- **优点**: 字节跳动生产验证（Kitex/Hertz），减少 goroutine 数量（1:1 goroutine:request vs 1:1 goroutine:conn），零拷贝读写，适合 RPC/高并发
+- **缺点**: 不支持 Windows；API 不兼容 `net/http`；学习曲线；阻塞粒度从 g 上升到 m（与 Go GMP 调度哲学冲突）
+- **安全风险**: 间接依赖 CVE-2022-29526（中危，golang.org/x/sys）和 CVE-2022-41723（高危，golang.org/x/net），需保持依赖更新
+- **安全记录**: 无直接发布的 security advisories；无 SECURITY.md；建议谨慎评估
+- **性能数据**: 官方 benchmark 显示 QPS 提升 ~184%（128K vs 45K），内存减少 ~71%，延迟降低 ~68%（RPC 场景，1000 并发，4核8G）
+- **适用**: 仅在 benchmark 验证有明确优势后，作为可选编译标签接入
 
 **方案 C: `gnet`（纯事件驱动）**
 
 - **优点**: 类似 Redis 的单线程事件循环，延迟极低
 - **缺点**: Go 1.23+ 的 netpoller 已大幅优化，收益递减；需自行处理 HTTP 协议
-- **适用**: 特定定制协议场景
-
-**推荐策略**:  
-- **Phase 1**: 标准库 `net/http` 构建核心，快速验证架构  
-- **Phase 2**: 对 proxy/upstream 路径可选接入 `netpoll` 做零拷贝优化  
-- **Phase 3**: 性能测试后决定是否需要 `gnet` 级优化
+- **适用**: 特定定制协议场景，gonx 暂不考虑
 
 ### 4.2 对象池设计（替代 `ngx_palloc`）
 
@@ -286,7 +284,7 @@ type RequestPool struct {
 
 ### 4.3 配置解析器设计（替代 `ngx_conf_file`）
 
-**方案 A: 兼容 nginx 配置语法（推荐）**
+**推荐方案 A: 兼容 nginx 配置语法子集（已确认）**
 
 自研递归下降解析器，支持 nginx 配置语法子集：
 
@@ -327,26 +325,11 @@ type ServerConfig struct {
 }
 ```
 
-**方案 B: 现代配置格式（YAML/TOML）**
+**方案 B/C: YAML/TOML（已排除）**
+- 不纳入支持范围，保持配置语法单一性
 
-```yaml
-servers:
-  - listen: ":80"
-    server_name: example.com
-    locations:
-      - path: "/"
-        proxy_pass: "http://backend"
-
-upstreams:
-  backend:
-    servers:
-      - "127.0.0.1:8080 weight=5"
-      - "127.0.0.1:8081"
-    keepalive: 32
-```
-
-**推荐策略**:  
-- **配置文件语法**: 支持 nginx 子集（兼容存量配置），内部转换为 Go 结构体  
+**推荐策略（已确认）**:  
+- **配置文件语法**: 仅支持 nginx 语法子集（兼容存量配置），内部转换为 Go 结构体  
 - **动态配置**: 通过 Admin API (REST/gRPC) 修改运行时配置，无需 reload  
 - **配置热重载**: 文件变更监听 + 差分更新（无需 worker 进程重启）
 
@@ -550,15 +533,23 @@ Go 不需要 nginx 的多进程模型：
 
 ---
 
-## 9. 待决策事项
+## 9. 已确认决策（2026-05-30）
 
-1. **配置语法**: 是否支持 nginx 原生配置语法，还是只支持 YAML/TOML？
-2. **网络层选型**: Phase 1 是否直接用 `cloudwego/netpoll`，还是先用标准库？
-3. **HTTP/3**: 是否纳入路线图，还是等 Go 生态成熟？
-4. **Mail 代理**: 是否有明确需求，还是直接 Skip？
-5. **Lua 支持**: 是否需要兼容 nginx Lua 模块（用 gopher-lua）？
-6. **WASM 插件**: 是否用 WASM 作为跨语言插件方案？
+| 决策项 | 确认结果 | 说明 |
+|--------|---------|------|
+| **配置语法** | ✅ 仅兼容 nginx 子集 | 不支持 YAML/TOML/双语法，保持单一性 |
+| **网络层选型** | ✅ 标准库基线 | Phase 1~2 用 `net/http`；netpoll 仅在 benchmark 验证有明确优势后作为可选编译标签接入 |
+| **HTTP/3** | ❌ 不纳入路线图 | 暂不实现，等 Go 生态成熟后评估 |
+| **Mail 代理** | ❌ 直接 Skip | 现阶段不实现，Go 生态有专用方案 |
+| **Lua 支持** | ❌ 不需要 | 不引入 gopher-lua |
+| **WASM 插件** | ❌ 不需要 | 不引入 WASM 跨语言方案 |
+
+## 10. 待决策事项
+
+1. **netpoll 接入时机**: 是否需要 Phase 1 就设计 `netpoll` 兼容接口，还是 Phase 3 再考虑？
+2. **Stream (L4) 优先级**: 是否需要在 HTTP 稳定前就启动 Stream 模块？
+3. **Admin API 风格**: REST-only 还是 REST + gRPC 双协议？
 
 ---
 
-> **本计划为分析阶段产物，所有技术选型待验证后可调整。下一阶段进入 Phase 0 骨架搭建。**
+> **本计划已更新为确认版本。下一阶段进入 Phase 0 骨架搭建。**
