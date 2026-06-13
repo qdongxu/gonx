@@ -38,3 +38,8 @@ func (p *PlaceholderParser) Parse(r io.Reader) (*Config, error) {
 func NewPlaceholderParser() ConfigParser {
 	return &PlaceholderParser{}
 }
+
+// NewParser creates a real nginx config parser.
+func NewParser() ConfigParser {
+	return NewNginxParser()
+}
